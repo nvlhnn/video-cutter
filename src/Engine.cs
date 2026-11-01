@@ -335,7 +335,7 @@ namespace VideoCutter
             return Info.Duration;
         }
 
-        public double OutputLength { get { return Loop ? LoopLength : Out - (Exact ? In : CopyStart); } }
+        public double OutputLength { get { return Loop ? LoopLength : Exact ? (Out - In) / Speed : Out - CopyStart; } }
 
         const string Streams = " -map 0 -dn -ignore_unknown -map_metadata 0";
 
@@ -391,52 +391,205 @@ namespace VideoCutter
 
         public bool Loop;
         public double LoopLength;     // seconds of output
+        public int Cycles;            // >0: output is exactly this many whole cycles (length taken from the rendered cycle)
         public double Fade;           // crossfade seconds (0 = plain loop)
+        public bool Mirror;           // loop plays forward, then backward (first and last frame meet)
+        public double Speed = 1;      // playback speed of the output (0.25 .. 4)
+        public bool Preview;          // build a light preview (≤1280 wide, fast encoder, AAC audio in MP4)
 
         int FramesOf(double sec) { return (int)Math.Round(sec * Info.Fps); }
+        bool Sped { get { return Math.Abs(Speed - 1) > 0.0001; } }
+        public bool HasSpeed { get { return Sped; } }
+        int SpeedFrames(int sourceFrames) { return Sped ? Math.Max(1, (int)Math.Round(sourceFrames / Speed)) : sourceFrames; }
 
-        /// Length of one loop cycle in the output.
-        public double CycleLength
+        /// Source frames in one loop cycle (before speed).
+        int CycleSourceFrames
         {
             get
             {
-                int n = FramesOf(Out - In), nf = Fade > 0 ? Math.Min(FramesOf(Fade), n / 2) : 0;
-                return (n - nf) / Info.Fps;
+                int n = FramesOf(Out - In);
+                if (Mirror) return Math.Max(1, 2 * n - 2);
+                int nf = Fade > 0 ? Math.Max(1, Math.Min(FramesOf(Fade), n / 2)) : 0;
+                return n - nf;
             }
         }
 
-        public string LoopUnitArgs(string unit, bool gpu)
+        /// Length of one loop cycle in the output (after speed).
+        public double CycleLength { get { return SpeedFrames(CycleSourceFrames) / Info.Fps; } }
+
+        string FpsExpr { get { return Tools.ParseRate(Info.Video.RFrameRate) > 0 ? Info.Video.RFrameRate : Tools.N(Info.Fps); } }
+
+        /// Video speed change keeping the source frame rate, cut to exactly `frames` output frames.
+        string VSpeed(int frames)
         {
-            double coarse = Coarse;
+            if (!Sped) return "";
+            return ",setpts=PTS/" + Tools.N(Speed) + ",fps=" + FpsExpr + ",tpad=stop_mode=clone:stop=4,trim=end_frame=" + frames + ",setpts=PTS-STARTPTS";
+        }
+
+        /// Audio tempo change without pitch change (atempo takes 0.5..2 per stage).
+        string ASpeed()
+        {
+            if (!Sped) return "";
+            var r = new StringBuilder();
+            double s = Speed;
+            while (s > 2.0001) { r.Append(",atempo=2"); s /= 2; }
+            while (s < 0.4999) { r.Append(",atempo=0.5"); s /= 0.5; }
+            r.Append(",atempo=" + Tools.N(s));
+            return r.ToString();
+        }
+
+        string VideoOut(bool gpu, bool allowTag)
+        {
+            if (!Preview) return VideoEncodeOpts(":v:0", gpu, allowTag);
+            return gpu ? " -c:v h264_nvenc -preset p1 -rc vbr -cq 19 -b:v 0" : " -c:v libx264 -preset ultrafast -crf 18";
+        }
+        string PreviewScale { get { return Preview ? ",scale='min(1280,iw)':-2,format=yuv420p" : ""; } }
+
+        /// Filter graph for one plain/crossfade cycle (with speed), starting at In. Outputs [v] and [a0..].
+        string CycleFilter(double coarse, out int outFrames)
+        {
             double vs = Math.Max(0, In - coarse - 0.0005);     // video start (relative to the input seek)
             double au = Math.Max(0, In - coarse);              // audio start
             int n = FramesOf(Out - In);
             int nf = Fade > 0 ? Math.Max(1, Math.Min(FramesOf(Fade), n / 2)) : 0;
             double lx = n / Info.Fps, fx = nf / Info.Fps;
+            outFrames = SpeedFrames(n - nf);
+            double ol = outFrames / Info.Fps;                  // output length of the cycle
             var audio = Info.Audio.ToList();
             var f = new StringBuilder();
             f.Append("[0:v:" + Info.VideoOrdinal + "]trim=start=" + Tools.N(vs) + ",setpts=PTS-STARTPTS,trim=end_frame=" + n + ",setpts=PTS-STARTPTS");
-            if (nf == 0) f.Append("[v]");
-            else
+            if (nf > 0)
                 f.Append(",split[s1][s2];[s1]trim=start_frame=" + nf + ",setpts=PTS-STARTPTS[tl];[s2]trim=end_frame=" + nf +
-                         ",setpts=PTS-STARTPTS[hd];[tl][hd]xfade=transition=fade:duration=" + Tools.N(fx) + ":offset=" + Tools.N(lx - 2 * fx) + "[v]");
-            for (int i = 0; i < audio.Count; i++)
+                         ",setpts=PTS-STARTPTS[hd];[tl][hd]xfade=transition=fade:duration=" + Tools.N(fx) + ":offset=" + Tools.N(lx - 2 * fx));
+            f.Append(VSpeed(outFrames) + PreviewScale + "[v]");
+            for (int i = 0; i < audio.Count && (!Preview || i == 0); i++)
             {
                 // trim to exactly the video length (pad if the audio is short) so the cycles line up
                 f.Append(";[0:a:" + i + "]atrim=start=" + Tools.N(au) + ",asetpts=PTS-STARTPTS,apad,atrim=end=" + Tools.N(lx) + ",asetpts=PTS-STARTPTS");
-                if (nf == 0) f.Append("[a" + i + "]");
-                else
+                if (nf > 0)
                     f.Append(",asplit[x" + i + "][y" + i + "];[x" + i + "]atrim=start=" + Tools.N(fx) + ",asetpts=PTS-STARTPTS[at" + i + "];[y" + i +
-                             "]atrim=end=" + Tools.N(fx) + ",asetpts=PTS-STARTPTS[ah" + i + "];[at" + i + "][ah" + i + "]acrossfade=d=" + Tools.N(fx) + ":c1=tri:c2=tri[a" + i + "]");
+                             "]atrim=end=" + Tools.N(fx) + ",asetpts=PTS-STARTPTS[ah" + i + "];[at" + i + "][ah" + i + "]acrossfade=d=" + Tools.N(fx) + ":c1=tri:c2=tri");
+                f.Append(ASpeed() + ",apad,atrim=end=" + Tools.N(ol) + ",asetpts=PTS-STARTPTS[a" + i + "]");
+            }
+            return f.ToString();
+        }
+
+        int AudioOutCount { get { int c = Info.Audio.Count(); return Preview ? Math.Min(1, c) : c; } }
+
+        string MapAudio()
+        {
+            var r = new StringBuilder();
+            for (int i = 0; i < AudioOutCount; i++) r.Append(" -map [a" + i + "]");
+            return r.ToString();
+        }
+
+        /// Audio codec for the loop cycle: lossless PCM (MKV) for exports, AAC (MP4) for previews.
+        string UnitAudioCodec { get { return AudioOutCount == 0 ? "" : Preview ? " -c:a aac -b:a 192k" : " -c:a pcm_s24le"; } }
+
+        /// Frame-accurate cut with a speed change (re-encodes video and audio; subtitles are left out).
+        public string ExactSpeedArgs(string output, bool gpu)
+        {
+            double coarse = Coarse;
+            int frames;
+            string f = CycleFilterPlain(coarse, out frames);
+            var a = new StringBuilder();
+            a.Append("-hide_banner -nostdin -y -ss " + Tools.N(coarse) + " -i " + Tools.Q(Info.Path));
+            a.Append(" -filter_complex " + Tools.Q(f) + " -map [v]" + MapAudio());
+            a.Append(VideoEncodeOpts(":v:0", gpu, true));
+            var audio = Info.Audio.ToList();
+            for (int i = 0; i < audio.Count; i++) a.Append(AudioEncodeOpts(audio[i], ":a:" + i));
+            a.Append(" -map_metadata 0 -progress pipe:1 -nostats " + Tools.Q(output));
+            return a.ToString();
+        }
+
+        string CycleFilterPlain(double coarse, out int frames)
+        {
+            double saveFade = Fade; bool saveMirror = Mirror;
+            Fade = 0; Mirror = false;
+            try { return CycleFilter(coarse, out frames); }
+            finally { Fade = saveFade; Mirror = saveMirror; }
+        }
+
+        /// The ffmpeg runs that build one loop cycle into `unit`. Each entry: (arguments, seconds of output for progress).
+        /// Mirror cycles are built from small chunks (the backward part is reversed 2 s at a time), so memory stays low
+        /// even for long selections; the chunks are then joined without re-encoding.
+        public List<KeyValuePair<string, double>> UnitSteps(string unit, bool gpu, List<string> temps)
+        {
+            var steps = new List<KeyValuePair<string, double>>();
+            if (!Mirror)
+            {
+                double coarse = Coarse;
+                int frames;
+                string f = CycleFilter(coarse, out frames);
+                var a = new StringBuilder();
+                a.Append("-hide_banner -nostdin -y -ss " + Tools.N(coarse) + " -i " + Tools.Q(Info.Path));
+                a.Append(" -filter_complex " + Tools.Q(f) + " -map [v]" + MapAudio());
+                a.Append(VideoOut(gpu, false) + UnitAudioCodec);
+                a.Append(" -map_metadata -1 -progress pipe:1 -nostats " + Tools.Q(unit));
+                steps.Add(new KeyValuePair<string, double>(a.ToString(), frames / Info.Fps));
+                return steps;
+            }
+
+            int n = Math.Max(3, FramesOf(Out - In));
+            string ext = Path.GetExtension(unit);
+            string dir = Path.GetDirectoryName(unit), stem = Path.GetFileNameWithoutExtension(unit);
+            var parts = new List<string>();
+            // forward: frames 0 .. n-1
+            parts.Add(ChunkStep(steps, Path.Combine(dir, stem + ".part0" + ext), 0, n, false, gpu));
+            // backward: frames n-2 down to 1, in chunks of ~2 s
+            int chunk = Math.Max(8, FramesOf(2));
+            int k = 1;
+            for (int hi = n - 1; hi > 1; hi -= chunk, k++)
+            {
+                int lo = Math.Max(1, hi - chunk);
+                parts.Add(ChunkStep(steps, Path.Combine(dir, stem + ".part" + k + ext), lo, hi - lo, true, gpu));
+            }
+            temps.AddRange(parts);
+            string list = Path.Combine(dir, stem + ".parts.txt");
+            temps.Add(list);
+            File.WriteAllLines(list, parts.Select(p => "file '" + p.Replace("'", "'\\''") + "'").ToArray(), new UTF8Encoding(false));
+            steps.Add(new KeyValuePair<string, double>("-hide_banner -nostdin -y -f concat -safe 0 -i " + Tools.Q(list) +
+                " -map 0 -c copy -map_metadata -1 -progress pipe:1 -nostats " + Tools.Q(unit), 0));
+            return steps;
+        }
+
+        /// One mirror chunk: `count` source frames starting `first` frames after In, optionally reversed.
+        string ChunkStep(List<KeyValuePair<string, double>> steps, string file, int first, int count, bool reverse, bool gpu)
+        {
+            double fps = Info.Fps;
+            double t0 = In + first / fps;
+            double coarse = CoarseFor(t0);
+            double vs = Math.Max(0, t0 - coarse - 0.0005), au = Math.Max(0, t0 - coarse);
+            int outFrames = SpeedFrames(count);
+            double len = count / fps, ol = outFrames / fps;
+            var f = new StringBuilder();
+            f.Append("[0:v:" + Info.VideoOrdinal + "]trim=start=" + Tools.N(vs) + ",setpts=PTS-STARTPTS,trim=end_frame=" + count + ",setpts=PTS-STARTPTS");
+            if (reverse) f.Append(",reverse");
+            f.Append(VSpeed(outFrames) + PreviewScale + "[v]");
+            for (int i = 0; i < AudioOutCount; i++)
+            {
+                f.Append(";[0:a:" + i + "]atrim=start=" + Tools.N(au) + ",asetpts=PTS-STARTPTS,apad,atrim=end=" + Tools.N(len) + ",asetpts=PTS-STARTPTS");
+                if (reverse) f.Append(",areverse");
+                f.Append(ASpeed() + ",apad,atrim=end=" + Tools.N(ol) + ",asetpts=PTS-STARTPTS[a" + i + "]");
             }
             var a = new StringBuilder();
             a.Append("-hide_banner -nostdin -y -ss " + Tools.N(coarse) + " -i " + Tools.Q(Info.Path));
-            a.Append(" -filter_complex " + Tools.Q(f.ToString()) + " -map [v]");
-            for (int i = 0; i < audio.Count; i++) a.Append(" -map [a" + i + "]");
-            a.Append(VideoEncodeOpts(":v:0", gpu, false));
-            if (audio.Count > 0) a.Append(" -c:a pcm_s24le");
-            a.Append(" -map_metadata -1 -progress pipe:1 -nostats " + Tools.Q(unit));
-            return a.ToString();
+            a.Append(" -filter_complex " + Tools.Q(f.ToString()) + " -map [v]" + MapAudio());
+            a.Append(VideoOut(gpu, false) + UnitAudioCodec);
+            a.Append(" -map_metadata -1 -progress pipe:1 -nostats " + Tools.Q(file));
+            steps.Add(new KeyValuePair<string, double>(a.ToString(), ol));
+            return file;
+        }
+
+        /// Frames in a rendered file (fast: counts packets, no decoding).
+        public static int CountFrames(string file)
+        {
+            try
+            {
+                string o = Tools.RunText(Tools.FFprobe, "-v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 " + Tools.Q(file));
+                int c; return int.TryParse(o.Trim().TrimEnd(','), out c) ? c : 0;
+            }
+            catch { return 0; }
         }
 
         /// Fast input-seek point for any time t (the keyframe before it).
@@ -681,12 +834,13 @@ namespace VideoCutter
                 {
                     bool gpu = ExportJob.HasGpuEncoder(job.Info.Video.Codec);
                     UsedEncoder = ExportJob.Encoder(job.Info.Video.Codec, gpu);
-                    ok = RunOne(job.ExactArgs(tmp, gpu), job.OutputLength);
+                    Func<bool, string> args = g => job.HasSpeed ? job.ExactSpeedArgs(tmp, g) : job.ExactArgs(tmp, g);
+                    ok = RunOne(args(gpu), job.OutputLength);
                     if (!ok && gpu && !cancelled)
                     {
                         if (Status != null) Status("GPU encoder failed - retrying on CPU...");
                         UsedEncoder = ExportJob.Encoder(job.Info.Video.Codec, false);
-                        ok = RunOne(job.ExactArgs(tmp, false), job.OutputLength);
+                        ok = RunOne(args(false), job.OutputLength);
                     }
                 }
                 if (!ok || cancelled) { TryDelete(tmp); if (cancelled) LastError = "Cancelled."; return false; }
@@ -709,23 +863,28 @@ namespace VideoCutter
         bool RunLoop(ExportJob job, string tmp)
         {
             string unit = Path.Combine(Path.GetDirectoryName(tmp), Path.GetFileNameWithoutExtension(job.Output) + ".loop-cycle.mkv");
+            var temps = new List<string>();
             try
             {
                 double cycle = job.CycleLength;
                 // rough weights: encoding the cycle is slow, repeating it (copy + audio encode) is fast
                 double w1 = cycle / (cycle + job.LoopLength / 15);
-                progBase = 0; progScale = w1;
                 if (Status != null) Status("Rendering one loop cycle...");
                 bool gpu = ExportJob.HasGpuEncoder(job.Info.Video.Codec);
                 UsedEncoder = ExportJob.Encoder(job.Info.Video.Codec, gpu);
-                bool ok = RunOne(job.LoopUnitArgs(unit, gpu), cycle);
+                bool ok = RunSteps(job.UnitSteps(unit, gpu, temps), 0, w1);
                 if (!ok && gpu && !cancelled)
                 {
                     if (Status != null) Status("GPU encoder failed - retrying on CPU...");
                     UsedEncoder = ExportJob.Encoder(job.Info.Video.Codec, false);
-                    ok = RunOne(job.LoopUnitArgs(unit, false), cycle);
+                    ok = RunSteps(job.UnitSteps(unit, false, temps), 0, w1);
                 }
                 if (!ok || cancelled) return false;
+                if (job.Cycles > 0)
+                {   // whole cycles: take the exact length from the rendered cycle
+                    int u = ExportJob.CountFrames(unit);
+                    if (u > 0) job.LoopLength = job.Cycles * u / job.Info.Fps;
+                }
                 if (Status != null) Status("Repeating to full length...");
                 progBase = w1; progScale = 1 - w1;
                 return RunOne(job.LoopFinalArgs(unit, tmp), job.LoopLength);
@@ -734,7 +893,24 @@ namespace VideoCutter
             {
                 progBase = 0; progScale = 1;
                 TryDelete(unit);
+                foreach (var t in temps) TryDelete(t);
             }
+        }
+
+        /// Runs several ffmpeg steps, spreading their progress over [from, to].
+        bool RunSteps(List<KeyValuePair<string, double>> steps, double from, double to)
+        {
+            double total = Math.Max(0.001, steps.Sum(s => Math.Max(0.05, s.Value)));
+            double done = 0;
+            foreach (var s in steps)
+            {
+                double w = Math.Max(0.05, s.Value);
+                progBase = from + (to - from) * done / total;
+                progScale = (to - from) * w / total;
+                if (!RunOne(s.Key, Math.Max(0.05, s.Value)) || cancelled) return false;
+                done += w;
+            }
+            return true;
         }
 
         bool RunOne(string args, double length)

@@ -1,5 +1,6 @@
 // Video Cutter - main window logic and entry point.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -61,6 +62,15 @@ namespace VideoCutter
                     if (a[5].StartsWith("loopxf") && (p.Length < 2 || !double.TryParse(p[1], System.Globalization.NumberStyles.Float, Tools.Inv, out fd))) { Console.WriteLine("bad fade"); return 2; }
                     job.Loop = true; job.LoopLength = len; job.Fade = fd;
                 }
+                // extra options after the mode: speed=0.5  mirror  cycles=N
+                for (int i = 6; i < a.Length; i++)
+                {
+                    double sp; int cy;
+                    if (a[i].StartsWith("speed=") && double.TryParse(a[i].Substring(6), System.Globalization.NumberStyles.Float, Tools.Inv, out sp)) job.Speed = Math.Max(0.25, Math.Min(4, sp));
+                    else if (a[i] == "mirror") { job.Mirror = true; job.Fade = 0; }
+                    else if (a[i].StartsWith("cycles=") && int.TryParse(a[i].Substring(7), out cy)) job.Cycles = cy;
+                }
+                if (job.Loop && job.Cycles > 0) job.LoopLength = job.Cycles * job.CycleLength;
                 job.Keyframes = Probe.Keyframes(info, CancellationToken.None);
                 var ex = new Exporter();
                 ex.Status += m => Console.WriteLine(m);
@@ -80,7 +90,11 @@ namespace VideoCutter
         MediaElement standby;           // loop preview: waits paused at START
         MediaElement p1, p2;
         Image frameImage;
-        RadioButton rbLoopOff, rbLoopPlain, rbLoopFade, rbLoopExport;
+        RadioButton rbLoopOff, rbLoopPlain, rbLoopFade, rbLoopMirror, rbLoopExport;
+        Slider speedSlider;
+        TextBlock txtSpeed;
+        static readonly double[] Speeds = { 0.25, 1.0 / 3, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 };
+        double speed = 1;
         TextBox tbFade, tbLoopLen;
         double loopLen = 600;
         int loopMode;                   // 0 off, 1 plain loop, 2 crossfade loop
@@ -127,6 +141,11 @@ namespace VideoCutter
             seamPlayer.MediaFailed += (s, e) => { EndSeam(); txtStatus.Text = "Couldn't play the seam preview."; };
             ClearCache();
             rbLoopExport = F<RadioButton>("RbLoopExport"); tbLoopLen = F<TextBox>("TbLoopLen");
+            rbLoopMirror = F<RadioButton>("RbLoopMirror");
+            rbLoopMirror.Checked += (s, e) => SetLoopMode(3);
+            speedSlider = F<Slider>("SpeedSlider"); txtSpeed = F<TextBlock>("TxtSpeed");
+            speedSlider.ValueChanged += (s, e) => SetSpeed(Speeds[Math.Max(0, Math.Min(Speeds.Length - 1, (int)Math.Round(speedSlider.Value)))]);
+            speedSlider.MouseDoubleClick += (s, e) => speedSlider.Value = 4;
             cbWholeCycles = F<CheckBox>("CbWholeCycles");
             F<Button>("BtnOneCycle").Click += (s, e) => SetOneCycle();
             cbWholeCycles.Checked += (s, e) => UpdateNote();
@@ -359,7 +378,7 @@ namespace VideoCutter
             foreach (var n in new[] { "BtnPrevKey", "BtnPrevFrame", "BtnPlay", "BtnNextFrame", "BtnNextKey", "BtnPlaySel", "BtnMute", "BtnSetIn", "BtnSetOut", "BtnGoIn", "BtnGoOut", "BtnSeam" })
                 F<Button>(n).IsEnabled = on;
             tbIn.IsEnabled = tbOut.IsEnabled = on;
-            rbLoopOff.IsEnabled = rbLoopPlain.IsEnabled = rbLoopFade.IsEnabled = on;
+            rbLoopOff.IsEnabled = rbLoopPlain.IsEnabled = rbLoopFade.IsEnabled = rbLoopMirror.IsEnabled = on;
             tbFade.IsEnabled = on && loopMode == 2;
             btnExport.IsEnabled = on && exporter == null;
             timeline.InvalidateVisual();
@@ -377,11 +396,12 @@ namespace VideoCutter
             playSel = selection;
             if (!selection && pos >= info.Duration - frameDur) Seek(0);
             if (pendingSeek.HasValue) { seekTimer.Stop(); player.Position = TimeSpan.FromSeconds(pendingSeek.Value); pendingSeek = null; }
+            ApplySpeed();
             player.Play();
             playing = true;
             btnPlay.Content = "";
             tick.Start();
-            if (selection && loopMode > 0) StartLoop();
+            if (selection && (loopMode == 1 || loopMode == 2)) StartLoop();
         }
 
         void Pause()
@@ -399,6 +419,7 @@ namespace VideoCutter
         void PlaySelection()
         {
             if (info == null) return;
+            if (loopMode == 3) { PlayMirror(); return; }   // backward playback has to be rendered
             Pause();
             Seek(inT);
             Play(true);
@@ -525,12 +546,14 @@ namespace VideoCutter
         {
             loopMode = m;
             tbFade.IsEnabled = info != null && m == 2;
+            if (seamActive) EndSeam();
             if (playing && playSel)
             {
                 if (m == 0) StopLoop();
+                else if (m == 3) Pause();                       // mirror is previewed by rendering
                 else { StopLoop(); StartLoop(); }
             }
-            if (m > 0) ParkStandby();
+            if (m == 1 || m == 2) ParkStandby();
             RefreshTimes(); UpdateNote();
         }
 
@@ -538,7 +561,29 @@ namespace VideoCutter
         {
             if (rbLoopOff.IsChecked == true) rbLoopPlain.IsChecked = true;
             else if (rbLoopPlain.IsChecked == true) rbLoopFade.IsChecked = true;
+            else if (rbLoopFade.IsChecked == true) rbLoopMirror.IsChecked = true;
             else rbLoopOff.IsChecked = true;
+        }
+
+        // ---------- Speed ----------
+
+        void SetSpeed(double s)
+        {
+            speed = s;
+            txtSpeed.Text = (Math.Abs(s - 1.0 / 3) < 0.001 ? "0.33" : s.ToString("0.##", Tools.Inv)) + "×";
+            ApplySpeed();
+            UpdateNote();
+        }
+
+        void ApplySpeed()
+        {
+            p1.SpeedRatio = speed; p2.SpeedRatio = speed;
+            if (seamPlayer != null) seamPlayer.SpeedRatio = speed;
+        }
+
+        void NudgeSpeed(int dir)
+        {
+            speedSlider.Value = Math.Max(speedSlider.Minimum, Math.Min(speedSlider.Maximum, Math.Round(speedSlider.Value) + dir));
         }
 
         void CommitFade()
@@ -566,7 +611,7 @@ namespace VideoCutter
         CheckBox cbWholeCycles;
         bool oneCycle;          // "1 cycle" button: follows the selection/fade automatically
 
-        ExportJob CycleJob() { return new ExportJob { Info = info, In = inT, Out = outT, Fade = loopMode == 2 ? EffFade : 0 }; }
+        ExportJob CycleJob() { return new ExportJob { Info = info, In = inT, Out = outT, Fade = loopMode == 2 ? EffFade : 0, Mirror = loopMode == 3, Speed = speed }; }
 
         int CycleFrames()
         {
@@ -871,6 +916,7 @@ namespace VideoCutter
         {
             if (info == null || seamRendering) return;
             if (seamActive) EndSeam();
+            if (loopMode == 3) { PlayMirror(); return; }
             if (loopMode == 0) rbLoopPlain.IsChecked = true;
             Pause();
             var job = new ExportJob { Info = info, In = inT, Out = outT, Keyframes = keyframes, Fade = loopMode == 2 ? EffFade : 0 };
@@ -900,19 +946,73 @@ namespace VideoCutter
                 txtStatus.Text = "Ready";
             }
             job.SeamLayout(SeamLead, out seamTailLen, out seamHeadFrom);
+            StartRendered(file, "Seam preview - exact frames, " + (job.Fade > 0 ? job.Fade.ToString("0.0##", Tools.Inv) + " s crossfade" : "plain jump") +
+                                " (as exported) - repeats, Space to stop", false);
+        }
+
+        /// Plays a rendered preview clip on top of the normal preview, repeating until stopped.
+        void StartRendered(string file, string badge, bool mirror)
+        {
+            seamMirror = mirror;
             seamActive = true;
             seamBadgeText = badgeText.Text; seamBadgeVis = previewBadge.Visibility;
-            badgeText.Text = "Seam preview - exact frames, " + (job.Fade > 0 ? job.Fade.ToString("0.0##", Tools.Inv) + " s crossfade" : "plain jump") +
-                             " (as exported) - repeats, Space to stop";
+            badgeText.Text = badge + (Math.Abs(speed - 1) > 0.001 ? "  ·  " + txtSpeed.Text : "");
             badgeText.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0xB2, 0xFF));
             previewBadge.Visibility = Visibility.Visible;
             seamPlayer.IsMuted = p1.IsMuted;
             seamPlayer.Volume = 1;
             seamPlayer.Source = new Uri(file);
             seamPlayer.Visibility = Visibility.Visible;
+            ApplySpeed();
             seamPlayer.Play();
             btnPlay.Content = "";
             seamTick.Start();
+        }
+
+        // ---------- Mirror preview ----------
+        // Windows' player can't play backward, so the mirrored cycle (forward, then backward) is rendered
+        // with the same steps as the export (preview quality) and played on repeat.
+
+        bool seamMirror;
+        int mirrorFrames;      // source frames in the selection (forward part)
+
+        async void PlayMirror()
+        {
+            if (info == null || seamRendering) return;
+            if (seamActive) EndSeam();
+            Pause();
+            int n = (int)Math.Round((outT - inT) * info.Fps);
+            if (n < 3) { txtStatus.Text = "The selection is too short for a mirror loop."; return; }
+            var job = new ExportJob { Info = info, In = inT, Out = outT, Keyframes = keyframes, Mirror = true, Preview = true };
+            string key = string.Format(Tools.Inv, "mirror|{0}|{1}|{2:0.000000}|{3:0.000000}", info.Path, info.Size, inT, outT);
+            string file = Path.Combine(CacheDir, "mirror-" + ((uint)key.GetHashCode()).ToString("x8") + ".mp4");
+            if (!File.Exists(file))
+            {
+                seamRendering = true;
+                txtStatus.Text = "Rendering mirror preview...";
+                int token = openToken;
+                bool ok = await Task.Run(() =>
+                {
+                    var temps = new List<string>();
+                    string tmp = file + ".part.mp4";
+                    try
+                    {
+                        Directory.CreateDirectory(CacheDir);
+                        try { foreach (var s in job.UnitSteps(tmp, true, temps)) Tools.RunText(Tools.FFmpeg, s.Key); }
+                        catch { foreach (var s in job.UnitSteps(tmp, false, temps)) Tools.RunText(Tools.FFmpeg, s.Key); }   // no GPU: CPU
+                        File.Move(tmp, file);
+                        return true;
+                    }
+                    catch { return false; }
+                    finally { foreach (var t in temps) try { File.Delete(t); } catch { } }
+                });
+                seamRendering = false;
+                if (token != openToken) return;
+                if (!ok) { txtStatus.Text = "Couldn't render the mirror preview."; return; }
+                txtStatus.Text = "Ready";
+            }
+            mirrorFrames = n;
+            StartRendered(file, "Mirror preview - forward, then backward (rendered) - repeats, Space to stop", true);
         }
 
         void SeamTick()
@@ -921,7 +1021,7 @@ namespace VideoCutter
             double c = seamPlayer.Position.TotalSeconds;
             double dur = seamPlayer.NaturalDuration.HasTimeSpan ? seamPlayer.NaturalDuration.TimeSpan.TotalSeconds : 0;
             // the player doesn't always report "ended" - stop on our own at the last frame
-            if (dur > 0 && c >= dur - 0.06) { SeamToEnd(); return; }
+            if (dur > 0 && c >= dur - (seamMirror ? 0.02 : 0.06)) { SeamToEnd(); return; }
             if (c > 0) pos = SeamMap(c);
             RefreshTimes();
         }
@@ -929,7 +1029,13 @@ namespace VideoCutter
         /// Clip time -> source time (for the playhead).
         double SeamMap(double c)
         {
-            double t = c < seamTailLen ? outT - seamTailLen + c : inT + seamHeadFrom + (c - seamTailLen);
+            double t;
+            if (seamMirror)
+            {   // forward through the selection, then back again
+                double f = c * info.Fps;
+                t = f < mirrorFrames ? inT + c : inT + (2 * mirrorFrames - 2 - f) / info.Fps;
+            }
+            else t = c < seamTailLen ? outT - seamTailLen + c : inT + seamHeadFrom + (c - seamTailLen);
             return Math.Max(0, Math.Min(info.Duration, t));
         }
 
@@ -949,6 +1055,8 @@ namespace VideoCutter
             seamEndedState = ended;
             if (seamPlayer.NaturalDuration.HasTimeSpan) pos = SnapFrame(SeamMap(seamPlayer.NaturalDuration.TimeSpan.TotalSeconds - frameDur));
             RefreshTimes();
+            // mirror: the restart is just the turn at START, so no hold
+            seamHoldTimer.Interval = seamMirror ? TimeSpan.FromMilliseconds(1) : TimeSpan.FromSeconds(SeamHold);
             seamHoldTimer.Start();
         }
         bool seamEndedState;
@@ -959,6 +1067,7 @@ namespace VideoCutter
             if (!seamActive) return;
             if (seamEndedState) seamPlayer.Stop();   // a player that reached the very end needs a stop to rewind
             seamPlayer.Position = TimeSpan.Zero;
+            ApplySpeed();
             seamPlayer.Play();
             seamHolding = false;
         }
@@ -1057,6 +1166,7 @@ namespace VideoCutter
                                            : "  This cut will start at " + Tools.Fmt(j.CopyStart) + " (" + extra.ToString("0.###", Tools.Inv) + " s earlier).";
                     }
                 }
+                if (Math.Abs(speed - 1) > 0.001) s = "Speed " + txtSpeed.Text + " needs re-encoding - use Frame-accurate or Looped to (you'll be asked to switch). " + s;
                 txtModeNote.Text = s;
             }
             else if (rbLoopExport.IsChecked == true)
@@ -1065,7 +1175,9 @@ namespace VideoCutter
                 int cycles; double length;
                 LoopPlan(out cycles, out length);
                 string style = loopMode == 2 ? EffFade.ToString("0.0##", Tools.Inv) + " s crossfade at each join (video starts at START + fade)"
-                                             : "frame-accurate jump END → START (pick Crossfade loop above to blend it)";
+                             : loopMode == 3 ? "mirror: forward, then backward - the end turns back into the start, no jump"
+                                             : "frame-accurate jump END → START (pick Crossfade loop or Mirror above to hide it)";
+                if (Math.Abs(speed - 1) > 0.001) style += ", at " + txtSpeed.Text + " speed (audio keeps its pitch)";
                 string s;
                 if (info == null) s = "Repeats the selection to the length you type.";
                 else if (cycles == 1)
@@ -1091,7 +1203,10 @@ namespace VideoCutter
                     s += " as " + info.Video.Codec.ToUpperInvariant() + (gpu ? " on the NVIDIA GPU" : "") +
                          " at ~" + Tools.Rate((long)(info.VideoBitRate * 1.1)) + " with the same resolution, fps and pixel format";
                 }
-                txtModeNote.Text = s + ". Audio is re-encoded in the same codec and bitrate so the file starts at 0 and audio matches the video exactly - clean for joining.";
+                s += ". Audio is re-encoded in the same codec and bitrate so the file starts at 0 and audio matches the video exactly - clean for joining.";
+                if (Math.Abs(speed - 1) > 0.001) s += " Speed " + txtSpeed.Text + ": same frame rate, audio keeps its pitch; subtitles are left out.";
+                if (loopMode >= 2) s += " This is one plain cut - the " + (loopMode == 2 ? "crossfade" : "mirror") + " style applies to Looped to.";
+                txtModeNote.Text = s;
             }
         }
 
@@ -1105,15 +1220,27 @@ namespace VideoCutter
             if (outT - inT < frameDur / 2) { MessageBox.Show(Window, "The selection is empty. Set START before END.", "Video Cutter"); return; }
             bool exact = rbExact.IsChecked == true;
             bool loop = rbLoopExport.IsChecked == true;
-            if (!exact && !loop && loopMode > 0)
+            if (!loop && ((!exact && loopMode > 0) || (exact && loopMode >= 2)))
             {
+                string why = !exact
+                    ? "Fast lossless cuts aren't loop-ready: they can start a little late and drop or add a couple of frames at the end, so repeating the file shows a jump."
+                    : "Frame-accurate exports one plain cut, without the " + (loopMode == 2 ? "crossfade" : "mirror (backward part)") + " you're previewing.";
                 var r = MessageBox.Show(Window,
-                    "You're previewing a loop, but Fast lossless cuts aren't loop-ready: they can start a little late and drop or add a couple of frames at the end, so repeating the file shows a jump.\n\n" +
+                    "You're previewing a loop. " + why + "\n\n" +
                     "Export exactly ONE loop cycle instead? It repeats seamlessly, just like the preview.\n\n" +
-                    "Yes = one loop cycle      No = Fast lossless cut anyway",
+                    "Yes = one loop cycle      No = " + (exact ? "plain Frame-accurate cut" : "Fast lossless cut") + " anyway",
                     "Video Cutter", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
                 if (r == MessageBoxResult.Cancel) return;
                 if (r == MessageBoxResult.Yes) { SetOneCycle(); loop = true; }
+            }
+            if (!exact && !loop && Math.Abs(speed - 1) > 0.001)
+            {
+                var r = MessageBox.Show(Window,
+                    "Speed " + txtSpeed.Text + " needs re-encoding, which Fast lossless can't do.\n\nExport Frame-accurate at " + txtSpeed.Text + " instead?\n\n" +
+                    "Yes = Frame-accurate at " + txtSpeed.Text + "      No = Fast lossless at normal speed",
+                    "Video Cutter", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+                if (r == MessageBoxResult.Cancel) return;
+                if (r == MessageBoxResult.Yes) { exact = true; rbExact.IsChecked = true; }
             }
             if (!exact && !loop && keyframes == null) { MessageBox.Show(Window, "Still finding keyframes - try again in a moment.", "Video Cutter"); return; }
             if (loop) CommitLoopLen();
@@ -1138,11 +1265,14 @@ namespace VideoCutter
             { MessageBox.Show(Window, "Choose a different name - the source file can't be overwritten.", "Video Cutter"); return; }
 
             var job = new ExportJob { Info = info, Output = output, In = inT, Out = outT, Exact = exact, Keyframes = keyframes };
+            if (exact || loop) job.Speed = speed;
             if (loop)
             {
                 int cycles; double length;
                 LoopPlan(out cycles, out length);
-                job.Loop = true; job.LoopLength = length; job.Fade = loopMode == 2 ? EffFade : 0;
+                job.Loop = true; job.LoopLength = length; job.Cycles = cycles;
+                job.Fade = loopMode == 2 ? EffFade : 0;
+                job.Mirror = loopMode == 3;
             }
             var ex = new Exporter();
             exporter = ex;
@@ -1151,10 +1281,10 @@ namespace VideoCutter
             progress.Value = 0;
             txtStatus.Text = loop ? "Rendering loop..." : exact ? "Encoding..." : "Copying...";
             var sw = Stopwatch.StartNew();
-            ex.Progress += (f, speed) => Window.Dispatcher.BeginInvoke(new Action(() =>
+            ex.Progress += (f, rate) => Window.Dispatcher.BeginInvoke(new Action(() =>
             {
                 progress.Value = f;
-                txtStatus.Text = (f * 100).ToString("0", Tools.Inv) + "%" + (speed.Length > 0 && speed != "N/A" ? "  ·  " + speed : "");
+                txtStatus.Text = (f * 100).ToString("0", Tools.Inv) + "%" + (rate.Length > 0 && rate != "N/A" ? "  ·  " + rate : "");
             }));
             ex.Status += m => Window.Dispatcher.BeginInvoke(new Action(() => txtStatus.Text = m));
 
@@ -1200,6 +1330,8 @@ namespace VideoCutter
                 case Key.P: PlaySelection(); break;
                 case Key.L: CycleLoop(); break;
                 case Key.S: PlaySeam(); break;
+                case Key.OemOpenBrackets: NudgeSpeed(-1); break;
+                case Key.OemCloseBrackets: NudgeSpeed(1); break;
                 case Key.M: ToggleMute(); break;
                 case Key.Home: Pause(); Seek(0); break;
                 case Key.End: Pause(); Seek(info.Duration); break;

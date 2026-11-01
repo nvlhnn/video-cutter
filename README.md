@@ -25,12 +25,21 @@ A small, fast Windows app for cutting a piece out of a video, keeping the source
 
 All audio tracks and subtitles are kept. The output uses the same container as the source (mp4 → mp4, mkv → mkv, …).
 
+### Speed
+
+The **speed slider** next to *Play selection* goes from 0.25× to 4×. **[** and **]** change it, and double-clicking it resets it to 1×. It changes the preview right away. It also applies to **Frame-accurate** and **Looped to** exports:
+- the video is re-timed and keeps the source frame rate (slow motion repeats frames, fast drops them),
+- the audio is slowed down or sped up without changing its pitch.
+
+Fast lossless can't change speed; if the speed isn't 1×, the app offers to switch to Frame-accurate.
+
 ### Loop preview
 
 Check how your selection looks when it repeats, for example a background loop for a music video. **LOOP PREVIEW** has three choices:
 - **Off**: *Play selection* stops at END.
 - **Loop**: END jumps straight back to START, with nothing added. Use this to see whether the cut loops seamlessly on its own.
 - **Crossfade loop**: the last part of the selection fades into the start, both picture and sound. Set the fade length in seconds next to it. It's never more than half the selection. The green ramp on the timeline shows the fade zone.
+- **Mirror**: plays forward, then backward, then forward again, so the end turns back into the start and there is never a jump. One cycle is the selection forward plus the selection backward, without repeating the two turning frames. Windows' player can't play backward, so *Play selection* and *Play seam* first render the mirrored cycle with FFmpeg (about a second for a few seconds of video), then play it on repeat. Export it with **Looped to → 1 cycle** for a single forward+backward file, or any length. The audio plays backward in the backward half too.
 
 Press **Play selection** (P) and it keeps looping until you pause. **L** switches between the loop modes.
 
@@ -49,7 +58,8 @@ To save the loop as a video, choose the **Looped to** export mode (see above). T
 | Mouse wheel on timeline | 1 frame back / forward |
 | I / O | Set start / end at the playhead |
 | P | Play only the selection (loops if a loop mode is on) |
-| L | Loop preview: Off → Loop → Crossfade loop |
+| L | Loop preview: Off → Loop → Crossfade loop → Mirror |
+| [ / ] | Slower / faster |
 | S | Play the loop seam |
 | Home / End | Go to the beginning / end |
 | M | Mute |
@@ -83,7 +93,7 @@ The exe has a command-line test mode that uses the same export code as the butto
 VideoCutter.exe --export "in.mp4" "out.mp4" 5.1 12.5 exact
 ```
 
-The last word can be `copy`, `exact`, `loop=1:00:00` (plain loop to 1 hour) or `loopxf=1:00:00,1.0` (crossfade loop with a 1 s fade).
+The mode can be `copy`, `exact`, `loop=1:00:00` (plain loop to 1 hour) or `loopxf=1:00:00,1.0` (crossfade loop with a 1 s fade). You can add `speed=0.5`, `mirror`, or `cycles=N` (exactly N whole loop cycles) after it.
 
 First create the test clips. They're synthetic, made by FFmpeg, and not stored in the repo:
 

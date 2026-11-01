@@ -190,6 +190,13 @@
         <Button x:Name="BtnNextKey" Style="{StaticResource Icon}" Content="&#xE893;" ToolTip="Next keyframe (Ctrl+Right)"/>
       </StackPanel>
       <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,10,0"
+                    ToolTip="Playback speed. Also used by Frame-accurate and Looped to exports (audio keeps its pitch). Double-click to reset to 1×. Keys: [ and ]">
+          <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xEC4A;" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <Slider x:Name="SpeedSlider" Width="110" Minimum="0" Maximum="10" Value="4" TickFrequency="1" IsSnapToTickEnabled="True"
+                  VerticalAlignment="Center" Focusable="False"/>
+          <TextBlock x:Name="TxtSpeed" Text="1×" FontFamily="Consolas" Width="44" Margin="6,0,0,0" VerticalAlignment="Center"/>
+        </StackPanel>
         <Button x:Name="BtnPlaySel" ToolTip="Play only the selected part (P)">
           <StackPanel Orientation="Horizontal">
             <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE768;" VerticalAlignment="Center" Margin="0,0,6,0" FontSize="11"/>
@@ -228,6 +235,8 @@
           <RadioButton x:Name="RbLoopOff" Style="{StaticResource Seg}" GroupName="loop" IsChecked="True" Content="Off" ToolTip="Play selection stops at END (L cycles loop modes). A looped export uses a plain loop."/>
           <RadioButton x:Name="RbLoopPlain" Style="{StaticResource Seg}" GroupName="loop" Content="Loop" ToolTip="END jumps straight back to START - shows whether the cut loops seamlessly"/>
           <RadioButton x:Name="RbLoopFade" Style="{StaticResource Seg}" GroupName="loop" Content="Crossfade loop" ToolTip="The end blends into the start over the fade time"/>
+          <RadioButton x:Name="RbLoopMirror" Style="{StaticResource Seg}" GroupName="loop" Content="Mirror"
+                       ToolTip="Forward, then backward, then forward again: the end turns back into the start, so there is never a jump. Previewed by rendering (about a second)."/>
           <TextBox x:Name="TbFade" Width="54" Text="1.0" FontSize="13" Margin="4,0,0,0" ToolTip="Crossfade length in seconds - press Enter"/>
           <TextBlock Text="s" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="4,0,8,0"/>
           <Button x:Name="BtnSeam" ToolTip="Frame-exact preview of the loop point: 2 s before END, the jump or crossfade, 2 s after START - rendered exactly like the export (S)">
@@ -260,7 +269,7 @@
                            ToolTip="Repeat the selection until the length you type. Plain or crossfade follows the LOOP PREVIEW setting.">
                 <TextBlock FontWeight="SemiBold" Text="Looped to"/>
               </RadioButton>
-              <TextBox x:Name="TbLoopLen" Width="104" Text="00:10:00" FontSize="13"
+              <TextBox x:Name="TbLoopLen" Width="122" Text="00:10:00" FontSize="13"
                        ToolTip="Total length of the looped video, e.g. 10:00 or 1:00:00 - press Enter"/>
               <Button x:Name="BtnOneCycle" Margin="6,0,0,0" Padding="9,5"
                       ToolTip="Exactly one loop cycle: a file that repeats seamlessly (FFmpeg -stream_loop, OBS repeat, video editors)">1 cycle</Button>

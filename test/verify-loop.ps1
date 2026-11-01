@@ -99,6 +99,27 @@ foreach ($c in $cases) {
         }
     }
 }
+# Mirror and speed: one cycle = forward n frames + backward n-2 frames; speed scales the frame count
+$src = Join-Path $PSScriptRoot 'clip test ünï 日本.mp4'
+$fps = 30000 / 1001; $a = 153; $b = 303; $n = $b - $a
+foreach ($t in @(@{ tag = 'mirror'; extra = @('mirror', 'cycles=1'); want = 2 * $n - 2 },
+                 @{ tag = 'mirror 0.5x'; extra = @('mirror', 'speed=0.5', 'cycles=1'); want = 2 * (2 * $n - 2) },
+                 @{ tag = 'plain 2x, 3 cycles'; extra = @('speed=2', 'cycles=3'); want = 3 * [math]::Round($n / 2) })) {
+    $out = Join-Path $PSScriptRoot ("out " + $t.tag + ".mp4")
+    Write-Host "`n=== $($t.tag)  (want $($t.want) frames)"
+    $args2 = @('--export', "`"$src`"", "`"$out`"", (F ($a / $fps) '0.######'), (F ($b / $fps) '0.######'), 'loop=1') + $t.extra
+    $p = Start-Process -FilePath $Exe -ArgumentList $args2 -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ne 0) { Check 'export' $false ''; continue }
+    $oj = Probe $out
+    $ov = $oj.streams | Where-Object codec_type -eq 'video' | Select-Object -First 1
+    Check 'frame count' ([math]::Abs([int]$ov.nb_read_frames - $t.want) -le 1) "$($ov.nb_read_frames)"
+    Check 'starts at 0' ((P $ov.start_time) -eq 0) "video start $($ov.start_time)"
+    if ($t.tag -eq 'mirror') {
+        $s1 = FrameSsim $out ($n - 1) $src ($b - 1); $s2 = FrameSsim $out $n $src ($b - 2); $s3 = FrameSsim $out (2 * $n - 3) $src ($a + 1)
+        Check 'turns at END, comes back to START+1' (($s1, $s2, $s3 | Measure-Object -Minimum).Minimum -ge 0.97) "SSIM $(F $s1 '0.000'), $(F $s2 '0.000'), $(F $s3 '0.000')"
+    }
+}
+
 Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'out *' | Remove-Item
 Write-Host "`nFailures: $fail"
 exit $fail
